@@ -26,17 +26,29 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /out/loki-filtered-mcp ./cmd/server
 
 # ---------------------------------------------------------------------------
-# Runtime: distroless static — no shell, no package manager, non-root by
-# default. The binary is the whole image.
+# Runtime: alpine. The binary is static and needs nothing from the base, so the
+# base is here for the things distroless refuses to have — a shell to exec
+# into, wget for a HEALTHCHECK — plus ca-certificates for an https:// Loki.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.24
+
+RUN apk add --no-cache ca-certificates \
+    && adduser -D -H -u 65532 nonroot
 
 COPY --from=build /out/loki-filtered-mcp /usr/local/bin/loki-filtered-mcp
+
+# Numeric, never the name: Kubernetes runAsNonRoot refuses to start a container
+# whose image declares its user by name, since it cannot resolve the name to a
+# UID beforehand to check it is not 0.
+USER 65532:65532
 
 # Mount the config here, read-only:
 #   docker run -v ./config.yaml:/etc/loki-filtered-mcp/config.yaml:ro ...
 EXPOSE 8080
-USER nonroot:nonroot
+
+# Assumes the default listen address; drop it if server.listen moves off :8080.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/loki-filtered-mcp"]
 CMD ["-config", "/etc/loki-filtered-mcp/config.yaml"]

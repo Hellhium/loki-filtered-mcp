@@ -349,8 +349,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 Images are published to `ghcr.io/hellhium/loki-filtered-mcp` for `linux/amd64`
 and `linux/arm64` — `latest` from `master`, plus `1.2.3`/`1.2`/`1` for `v*` tags
-and a `sha-<commit>` tag for every build. The image is distroless: no shell, no
-package manager, runs as `nonroot`, and holds nothing but the binary.
+and a `sha-<commit>` tag for every build. The image is Alpine holding a static
+binary, and runs as UID **65532** — declared numerically, which is what
+Kubernetes `runAsNonRoot` needs in order to verify the user before starting the
+container.
 
 The config is not baked in — mount it at `/etc/loki-filtered-mcp/config.yaml`,
 or point `-config` elsewhere:
@@ -372,7 +374,20 @@ services:
     read_only: true
 ```
 
-`GET /healthz` is unauthenticated and is the liveness/readiness probe.
+`GET /healthz` is unauthenticated and is the liveness/readiness probe. The image
+also ships a `HEALTHCHECK` that polls it, which assumes the default `:8080` —
+override it if `server.listen` moves.
+
+On Kubernetes the image satisfies a locked-down pod:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities: { drop: ["ALL"] }
+```
 
 To build it yourself, `docker build --build-arg VERSION=$(git describe --tags
 --always) -t loki-filtered-mcp .` — the same Dockerfile CI uses.
