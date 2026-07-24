@@ -1,0 +1,8 @@
+# Reference-only clones (not part of this project)
+/references/
+
+# Build output
+/loki-filtered-mcp
+
+# Personal Claude Code overrides
+/.claude/settings.local.json

@@ -1,0 +1,135 @@
+# loki-filtered-mcp example configuration.
+#
+# This single file is the source of truth: the listen address, the Loki
+# endpoint(s), credentials, tenants, the enforced label filters, and query
+# defaults all come from here. The MCP tools expose NONE of these as arguments,
+# so a client cannot repoint the server or read logs outside its allowed scope.
+#
+# The server is multi-instance. Each instance is an authenticated scope with its
+# own bearer token(s), its own filters, its own enforcement policy, and its own
+# choice of surfaces (MCP and/or the Loki-compatible proxy). The token a client
+# presents is what selects the instance — there are no per-instance URLs.
+
+server:
+  # Address the HTTP server listens on. It serves every instance:
+  #   POST /mcp              — MCP over Streamable HTTP
+  #   /loki/api/v1/...       — the enforced, read-only Loki API
+  #   GET  /healthz          — liveness (the only unauthenticated path)
+  listen: ":8080"
+
+# ---------------------------------------------------------------------------
+# Defaults inherited by every instance. An instance overrides only the leaf
+# keys it sets; anything it omits is inherited from here.
+# ---------------------------------------------------------------------------
+
+loki:
+  # Upstream Loki base URL (http or https). A trailing /loki/api/v1 is optional.
+  url: "http://localhost:3100"
+
+  # Tenant, sent as the X-Scope-OrgID header. Leave empty for single-tenant Loki.
+  # A client's own X-Scope-OrgID header is always stripped and replaced by this.
+  org_id: ""
+
+  # Credentials WE send to Loki — not the ones clients present to us, which are
+  # each instance's auth.tokens. A bearer token wins over basic auth. Leave all
+  # empty for an unauthenticated Loki.
+  auth:
+    username: ""
+    password: ""
+    token: ""
+
+  # Per-request HTTP timeout. Should be >= your Grafana datasource timeout.
+  timeout: 30s
+
+enforcement:
+  # What to do when a query constrains an enforced label so that it EXCLUDES
+  # every allowed value (a genuine conflict, e.g. namespace="prod-secret").
+  # Narrowing within the allowed set is always permitted regardless of this.
+  #   reject   -> refuse the query with an error (fail closed, default)
+  #   override -> drop the caller's matcher and substitute the enforced one
+  # Prefer "override" on proxy-facing instances: Grafana template variables and
+  # ad-hoc filters routinely disagree with the instance's scope.
+  on_conflict: reject
+
+  # When true (the default), the label APIs are scoped to the enforced selector
+  # so they cannot reveal out-of-scope streams. A caller-supplied selector is
+  # enforced either way; this flag only governs injecting one where there is
+  # none. A request for an enforced label's values always returns just the
+  # configured values, without asking Loki, regardless of this setting.
+  enforce_label_apis: true
+
+defaults:
+  # Default row limit for loki_query when the tool call omits it.
+  limit: 100
+  # Default lookback window: when start is omitted it defaults to (end - since).
+  since: 1h
+
+# ---------------------------------------------------------------------------
+# Instances. At least one is required.
+# ---------------------------------------------------------------------------
+
+instances:
+  - # Identifies the instance in logs and startup errors. Never sent to clients.
+    name: team-a
+
+    auth:
+      # "bearer" is the only supported method. Clients send:
+      #   Authorization: Bearer <token>
+      type: bearer
+      # At least one token. A token must not be shared with another instance;
+      # that is refused at startup. List two while rotating — both are accepted
+      # until you remove the old one.
+      #
+      # Token strength is NOT enforced, so choose it well: this token is the
+      # entire attack surface of the scope below. Use at least 32 random
+      # characters, e.g.
+      #     openssl rand -base64 32 | tr -d '=+/'
+      tokens:
+        - "REPLACE-ME-team-a-0123456789abcdef0123456789abcdef"
+
+    endpoints:
+      # MCP over Streamable HTTP at POST /mcp. Defaults to true.
+      mcp: true
+      # Loki-compatible read API under /loki/api/v1/. Defaults to false.
+      # Point a Grafana Loki datasource here with a custom HTTP header
+      # "Authorization: Bearer <token>" and leave its tenant field empty.
+      proxy: true
+
+    # Enforced label filters for THIS instance. Every LogQL query it serves is
+    # rewritten so that every stream selector carries these matchers.
+    # At least one filter is required, and filters are NEVER inherited or merged
+    # between instances — each declares its full set.
+    #   - one value   -> equality matcher   label="value"
+    #   - many values -> regex alternation  label=~"v1|v2"  (values are quoted)
+    #
+    # A caller may narrow within the allowed set (e.g. namespace="team-a" when
+    # both team-a and team-b are allowed) and that narrowing is preserved.
+    filters:
+      - label: namespace
+        values: ["team-a", "team-b"]
+
+  - name: prod-readonly
+
+    auth:
+      type: bearer
+      tokens:
+        - "REPLACE-ME-prod-fedcba9876543210fedcba9876543210"
+
+    endpoints:
+      mcp: true
+      proxy: false # MCP clients only
+
+    filters:
+      - label: env
+        values: ["prod"]
+      - label: namespace
+        values: ["payments", "checkout"]
+
+    # Any of the top-level blocks may be overridden per instance. Keys not
+    # listed here keep the inherited value.
+    enforcement:
+      on_conflict: override
+    loki:
+      org_id: "tenant-prod" # url, auth and timeout are still inherited
+    defaults:
+      limit: 500
