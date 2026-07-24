@@ -117,10 +117,12 @@ type AuthOverride struct {
 	Token    *Secret `yaml:"token"`
 }
 
-// EnforcementOverride controls collision handling and label-API scoping.
+// EnforcementOverride controls collision handling, label-API scoping and
+// whether the enforced scope is disclosed to MCP clients.
 type EnforcementOverride struct {
 	OnConflict       *string `yaml:"on_conflict"`
 	EnforceLabelAPIs *bool   `yaml:"enforce_label_apis"`
+	DiscloseFilters  *bool   `yaml:"disclose_filters"`
 }
 
 // DefaultsOverride supplies fallback query parameters.
@@ -190,6 +192,12 @@ type Auth struct {
 type Enforcement struct {
 	OnConflict       string
 	EnforceLabelAPIs bool
+
+	// DiscloseFilters makes the MCP surface describe the scope it enforces —
+	// the enforced labels and their allowed values — in the handshake
+	// instructions and in the tool descriptions. It changes what a client is
+	// *told*, never what is enforced.
+	DiscloseFilters bool
 }
 
 // Defaults is a fully-resolved set of query defaults.
@@ -219,6 +227,12 @@ const (
 	defaultSince            = time.Hour
 	defaultConflict         = "reject"
 	defaultEnforceLabelAPIs = true
+
+	// Disclosure is on by default: a client that knows the scope it is confined
+	// to writes queries that fit it, instead of guessing and being rejected.
+	// The scope is not a secret — the filters are what the client's own token
+	// buys it, and every enforced query reveals them anyway.
+	defaultDiscloseFilters = true
 
 	// The MCP server is this project's primary purpose; the Loki-compatible
 	// proxy is opt-in per instance.
@@ -260,6 +274,7 @@ func (c *Config) Resolve() []ResolvedInstance {
 	globalEnf := applyEnforcement(Enforcement{
 		OnConflict:       defaultConflict,
 		EnforceLabelAPIs: defaultEnforceLabelAPIs,
+		DiscloseFilters:  defaultDiscloseFilters,
 	}, &c.Enforcement)
 	globalDef := applyDefaults(Defaults{
 		Limit: defaultLimit,
@@ -319,6 +334,9 @@ func applyEnforcement(base Enforcement, o *EnforcementOverride) Enforcement {
 	}
 	if o.EnforceLabelAPIs != nil {
 		base.EnforceLabelAPIs = *o.EnforceLabelAPIs
+	}
+	if o.DiscloseFilters != nil {
+		base.DiscloseFilters = *o.DiscloseFilters
 	}
 	return base
 }

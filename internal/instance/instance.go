@@ -51,12 +51,24 @@ func Build(ri config.ResolvedInstance, version string) (*Instance, error) {
 
 	if ri.MCP {
 		h := handlers.New(ri, enf, cli)
+
+		opts := []server.ServerOption{
+			server.WithToolCapabilities(false),
+			server.WithRecovery(),
+		}
+		// With enforcement.disclose_filters on, the handshake describes the
+		// scope this instance enforces — its labels and their allowed values,
+		// and nothing else about the config. Off, Instructions is empty and the
+		// handshake carries none.
+		if instr := h.Instructions(); instr != "" {
+			opts = append(opts, server.WithInstructions(instr))
+		}
+
 		s := server.NewMCPServer(
 			// Deliberately the product name, not the instance name: a client
 			// learns nothing about the server's topology from the handshake.
 			"loki-filtered-mcp", version,
-			server.WithToolCapabilities(false),
-			server.WithRecovery(),
+			opts...,
 		)
 		s.AddTool(h.QueryTool(), h.HandleQuery)
 		s.AddTool(h.LabelNamesTool(), h.HandleLabelNames)

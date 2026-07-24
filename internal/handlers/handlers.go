@@ -1,8 +1,13 @@
 // Package handlers implements the MCP tools. Every LogQL query is run through
 // the enforcer before it reaches Loki, and the tools deliberately expose no
-// endpoint/auth/tenant arguments — those come only from config. Tool
-// descriptions never interpolate config values (the reference server leaked
-// credentials into descriptions this way).
+// endpoint/auth/tenant arguments — those come only from config.
+//
+// The one config value that ever reaches a client is the enforced scope — the
+// filter labels and their allowed values — and only when
+// enforcement.disclose_filters is on. Nothing else is interpolated into the
+// handshake instructions or a tool description: not the upstream URL, the
+// tenant, any credential, the instance name, nor the existence of any other
+// instance (the reference server leaked credentials into descriptions this way).
 package handlers
 
 import (
@@ -33,6 +38,12 @@ type Handlers struct {
 	// scopeSelector is the enforced stream selector passed to Loki's label
 	// APIs, or "" when enforcement.enforce_label_apis is false.
 	scopeSelector string
+
+	// disclosed is the enforced selector rendered for the client, or "" when
+	// enforcement.disclose_filters is off. It gates every mention of the scope
+	// in the instructions and the tool descriptions; it never gates
+	// enforcement itself, which is unconditional.
+	disclosed string
 }
 
 // New wires the handlers for a single resolved instance.
@@ -41,7 +52,70 @@ func New(inst config.ResolvedInstance, enf *enforcer.Enforcer, cli *lokiclient.C
 	if inst.Enforcement.EnforceLabelAPIs {
 		h.scopeSelector = enf.Selector()
 	}
+	if inst.Enforcement.DiscloseFilters {
+		h.disclosed = enf.Selector()
+	}
 	return h
+}
+
+// --- scope disclosure -------------------------------------------------------
+
+// Instructions returns the MCP handshake instructions for this instance: a
+// plain statement of the scope every query is confined to, so a client writes
+// queries that fit it instead of discovering the boundary by being rejected.
+//
+// It is empty when enforcement.disclose_filters is off, in which case the
+// handshake says nothing about the filter set — the queries are enforced just
+// the same.
+func (h *Handlers) Instructions() string {
+	if h.disclosed == "" {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("This server exposes a filtered view of Loki. Every LogQL query you send is parsed and rewritten so that every stream selector carries the enforced matchers ")
+	sb.WriteString(h.disclosed)
+	sb.WriteString(".\n\nEnforced labels, and the only values reachable through this server:\n")
+	for _, f := range h.inst.Filters {
+		sb.WriteString("  - " + f.Label + ": " + strings.Join(f.Values, ", ") + "\n")
+	}
+
+	sb.WriteString("\nYou may narrow within those values — a matcher like ")
+	sb.WriteString(exampleNarrowing(h.inst.Filters))
+	sb.WriteString(" is kept as you wrote it. ")
+	if h.inst.Enforcement.OnConflict == "override" {
+		sb.WriteString("A matcher on an enforced label that excludes every value above is dropped and replaced by the enforced one, so the results you get back stay in scope even when your matcher did not.")
+	} else {
+		sb.WriteString("A matcher on an enforced label that excludes every value above is a conflict: the query is rejected and nothing is sent to Loki. Rewrite it to stay within the values above.")
+	}
+
+	sb.WriteString("\n\nloki_label_values on an enforced label returns exactly the values listed above. ")
+	if h.inst.Enforcement.EnforceLabelAPIs {
+		sb.WriteString("Every other label listing is scoped to the same selector, so it describes only streams inside this scope. ")
+	}
+	sb.WriteString("Logs outside this scope cannot be reached from here, and no tool argument changes the scope, the endpoint, the credentials or the tenant.")
+
+	return sb.String()
+}
+
+// scopeSuffix is the sentence appended to a tool description when the scope is
+// disclosed, so the scope is visible to clients that ignore instructions.
+func (h *Handlers) scopeSuffix() string {
+	if h.disclosed == "" {
+		return ""
+	}
+	return " Enforced scope: every stream selector is rewritten to carry " + h.disclosed + "."
+}
+
+// exampleNarrowing renders a concrete in-scope matcher from the first filter,
+// e.g. `namespace="team-a"`. Filters are validated as non-empty upstream.
+func exampleNarrowing(filters []config.Filter) string {
+	for _, f := range filters {
+		if len(f.Values) > 0 {
+			return f.Label + `="` + f.Values[0] + `"`
+		}
+	}
+	return "one on an enforced label"
 }
 
 // --- tool definitions -------------------------------------------------------
@@ -49,7 +123,7 @@ func New(inst config.ResolvedInstance, enf *enforcer.Enforcer, cli *lokiclient.C
 // QueryTool defines loki_query.
 func (h *Handlers) QueryTool() mcp.Tool {
 	return mcp.NewTool("loki_query",
-		mcp.WithDescription("Run a LogQL query against Loki. Configured label filters are enforced automatically; you cannot query outside the allowed scope."),
+		mcp.WithDescription("Run a LogQL query against Loki. Configured label filters are enforced automatically; you cannot query outside the allowed scope."+h.scopeSuffix()),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("query", mcp.Required(), mcp.Description("LogQL query string")),
@@ -63,7 +137,7 @@ func (h *Handlers) QueryTool() mcp.Tool {
 // LabelNamesTool defines loki_label_names.
 func (h *Handlers) LabelNamesTool() mcp.Tool {
 	return mcp.NewTool("loki_label_names",
-		mcp.WithDescription("List label names from Loki, scoped to the enforced filters."),
+		mcp.WithDescription("List label names from Loki, scoped to the enforced filters."+h.scopeSuffix()),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("start", mcp.Description("Start time (default: configured lookback before end)")),
@@ -75,7 +149,7 @@ func (h *Handlers) LabelNamesTool() mcp.Tool {
 // LabelValuesTool defines loki_label_values.
 func (h *Handlers) LabelValuesTool() mcp.Tool {
 	return mcp.NewTool("loki_label_values",
-		mcp.WithDescription("List values for a label from Loki, scoped to the enforced filters. For an enforced label, only the allowed values are returned."),
+		mcp.WithDescription("List values for a label from Loki, scoped to the enforced filters. For an enforced label, only the allowed values are returned."+h.scopeSuffix()),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("label", mcp.Required(), mcp.Description("Label name to list values for")),

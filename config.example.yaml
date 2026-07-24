@@ -58,6 +58,18 @@ enforcement:
   # configured values, without asking Loki, regardless of this setting.
   enforce_label_apis: true
 
+  # When true (the default), the MCP surface tells clients what it enforces:
+  # the handshake instructions and the tool descriptions name the enforced
+  # labels and their allowed values. That is context, not permission — a model
+  # that knows its scope writes queries that fit it instead of discovering the
+  # boundary by being rejected, and the scope is what the client's own token
+  # buys it anyway.
+  #
+  # Set to false to say nothing about the filters. Queries are enforced exactly
+  # the same either way; only the description changes. MCP only — the Loki
+  # proxy has no channel to say it in.
+  disclose_filters: true
+
 defaults:
   # Default row limit for loki_query when the tool call omits it.
   limit: 100
@@ -129,6 +141,7 @@ instances:
     # listed here keep the inherited value.
     enforcement:
       on_conflict: override
+      disclose_filters: false # this scope is not described to its clients
     loki:
       org_id: "tenant-prod" # url, auth and timeout are still inherited
     defaults:

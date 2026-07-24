@@ -271,3 +271,101 @@ func TestFormatQueryResultsRaw(t *testing.T) {
 		t.Errorf("raw output = %q", out)
 	}
 }
+
+// --- scope disclosure -------------------------------------------------------
+
+// TestDisclosureDescribesTheScope: with disclose_filters on, both the handshake
+// instructions and the tool descriptions name the enforced labels and their
+// allowed values, so a client can write in-scope queries on the first try.
+func TestDisclosureDescribesTheScope(t *testing.T) {
+	inst := baseInstance("reject", true)
+	inst.Enforcement.DiscloseFilters = true
+	h := testHandlers(t, inst, `{"status":"success","data":[]}`, nil, nil)
+
+	instr := h.Instructions()
+	for _, want := range []string{
+		`namespace=~"team-a|team-b"`, // the enforced selector
+		"namespace: team-a, team-b",  // the allowed values, spelled out
+		`namespace="team-a"`,         // a narrowing example
+		"rejected",                   // the reject policy, stated
+	} {
+		if !strings.Contains(instr, want) {
+			t.Errorf("instructions missing %q:\n%s", want, instr)
+		}
+	}
+
+	for _, tool := range []mcp.Tool{h.QueryTool(), h.LabelNamesTool(), h.LabelValuesTool()} {
+		if !strings.Contains(tool.Description, `namespace=~"team-a|team-b"`) {
+			t.Errorf("%s description does not disclose the scope: %q", tool.Name, tool.Description)
+		}
+	}
+}
+
+// TestDisclosureOverrideWording: the override policy is described as a
+// substitution, not a rejection — the two behave differently and a client that
+// is told the wrong one wastes turns.
+func TestDisclosureOverrideWording(t *testing.T) {
+	inst := baseInstance("override", true)
+	inst.Enforcement.DiscloseFilters = true
+	h := testHandlers(t, inst, `{"status":"success","data":[]}`, nil, nil)
+
+	instr := h.Instructions()
+	if !strings.Contains(instr, "replaced") {
+		t.Errorf("override instructions should describe the substitution:\n%s", instr)
+	}
+	if strings.Contains(instr, "the query is rejected") {
+		t.Errorf("override instructions must not promise rejection:\n%s", instr)
+	}
+}
+
+// TestDisclosureDisabled: with disclose_filters off, nothing a client can read
+// names the filters — and enforcement is unchanged.
+func TestDisclosureDisabled(t *testing.T) {
+	var gotQuery string
+	inst := baseInstance("reject", true) // DiscloseFilters defaults to false here
+	h := testHandlers(t, inst,
+		`{"status":"success","data":{"resultType":"streams","result":[]}}`,
+		&gotQuery, nil)
+
+	if instr := h.Instructions(); instr != "" {
+		t.Errorf("instructions should be empty when disclosure is off, got %q", instr)
+	}
+	for _, tool := range []mcp.Tool{h.QueryTool(), h.LabelNamesTool(), h.LabelValuesTool()} {
+		if strings.Contains(tool.Description, "namespace") ||
+			strings.Contains(tool.Description, "team-a") {
+			t.Errorf("%s description leaks the scope: %q", tool.Name, tool.Description)
+		}
+	}
+
+	// Enforcement is not what the flag governs.
+	if _, err := h.HandleQuery(context.Background(), req(map[string]any{"query": `{app="foo"}`})); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotQuery, `namespace=~"team-a|team-b"`) {
+		t.Errorf("query reaching Loki = %q, want the enforced matcher", gotQuery)
+	}
+}
+
+// TestDisclosureRevealsNothingElse pins the blast radius: the scope is the only
+// config value that may reach a client. Not the upstream, the tenant, the
+// instance name, or a token.
+func TestDisclosureRevealsNothingElse(t *testing.T) {
+	inst := baseInstance("reject", true)
+	inst.Enforcement.DiscloseFilters = true
+	inst.Name = "internal-instance-name"
+	inst.Loki.OrgID = "tenant-secret"
+	inst.Tokens = []config.Secret{config.Secret("token-secret-value")}
+	h := testHandlers(t, inst, `{"status":"success","data":[]}`, nil, nil)
+
+	texts := []string{h.Instructions(), h.QueryTool().Description,
+		h.LabelNamesTool().Description, h.LabelValuesTool().Description}
+	// inst.Loki.URL is the fake Loki's address, assigned by testHandlers.
+	for _, secret := range []string{"internal-instance-name", "tenant-secret",
+		"token-secret-value", inst.Loki.URL} {
+		for _, text := range texts {
+			if strings.Contains(text, secret) {
+				t.Errorf("client-visible text leaks %q:\n%s", secret, text)
+			}
+		}
+	}
+}

@@ -137,7 +137,9 @@ VS Code …):
 
 Once connected, the client sees three tools — `loki_query`,
 `loki_label_names`, `loki_label_values` — and nothing that lets it change the
-endpoint, the credentials or the scope. Ask it something like *"which namespaces
+endpoint, the credentials or the scope. The handshake also states the scope it
+is confined to, so it can write queries that fit (see
+[Scope disclosure](#scope-disclosure)). Ask it something like *"which namespaces
 can you see, and what errors are in them in the last hour?"*: the values it gets
 back for `namespace` are the configured ones and nothing else, and whatever
 query it then runs is rewritten to carry `namespace="team-a"` before it reaches
@@ -228,6 +230,39 @@ server or supply its own credentials.
 `start`/`end` accept `now`, a relative offset (`-1h`, `-30m`), or RFC3339.
 `format` is `raw` (default), `json`, or `text`.
 
+### Scope disclosure
+
+By default (`enforcement.disclose_filters: true`) the MCP surface **tells the
+client what it enforces**. The enforced labels and their allowed values go into
+the handshake `instructions` and into each tool description, so a model writes
+queries that fit its scope instead of finding the boundary by being rejected:
+
+```text
+This server exposes a filtered view of Loki. Every LogQL query you send is
+parsed and rewritten so that every stream selector carries the enforced
+matchers {namespace=~"team-a|team-b"}.
+
+Enforced labels, and the only values reachable through this server:
+  - namespace: team-a, team-b
+
+You may narrow within those values — a matcher like namespace="team-a" is kept
+as you wrote it. A matcher on an enforced label that excludes every value above
+is a conflict: the query is rejected and nothing is sent to Loki. …
+```
+
+The wording follows the instance: an `override` instance is told its
+conflicting matcher is *replaced* rather than rejected. Each tool description
+also carries a one-line `Enforced scope: …` suffix, for clients that ignore
+instructions.
+
+Set `disclose_filters: false` — globally or on one instance — and none of that
+is said: no instructions, no scope in the descriptions. **Queries are enforced
+identically either way**; the flag changes only what the client is told.
+
+The enforced scope is the *only* config value that ever reaches a client. The
+upstream URL, the tenant, the credentials, the instance name and the existence
+of any other instance are never disclosed, in either mode.
+
 ## The Loki proxy
 
 An instance with `endpoints.proxy: true` also serves a **read-only,
@@ -276,6 +311,7 @@ silent scope change this project exists to prevent.
 | `loki.timeout` | Per-request HTTP timeout | `30s` |
 | `enforcement.on_conflict` | `reject` or `override` | `reject` |
 | `enforcement.enforce_label_apis` | Scope the label APIs to the filters | `true` |
+| `enforcement.disclose_filters` | Tell MCP clients which labels are enforced, and their allowed values ([scope disclosure](#scope-disclosure)). Never changes what is enforced | `true` |
 | `defaults.limit` | Default row limit for `loki_query` | `100` |
 | `defaults.since` | Default lookback when `start` is omitted | `1h` |
 
@@ -411,6 +447,13 @@ the proxy alike. Endpoint, credentials and tenant are fixed by config and never
 exposed to clients. Instances share nothing: each has its own enforcer, Loki
 client and handlers, so serving the wrong scope is structurally impossible
 rather than one missed lookup away.
+
+**What a client is told.** With `disclose_filters` on, an MCP client learns the
+enforced labels and their allowed values — the scope its own token already
+buys — and nothing else about the config. Everything else stays inside: the
+upstream URL, the tenant, the credentials, the instance name, and the fact that
+other instances exist. Disclosure is a description of the boundary, never a way
+through it; turning it off hides the description and changes no enforcement.
 
 **Token handling.** Tokens are indexed by SHA-256, so the index holds no
 plaintext credential as a key and lookup cost does not vary with a correctly

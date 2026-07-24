@@ -67,9 +67,10 @@ func run(configPath string) error {
 		for _, in := range instances {
 			// Tokens are config.Secret and redact themselves, but they are not
 			// logged at all: an instance is identified by name.
-			log.Printf("  instance %q: endpoints=%s, %d filter(s), on_conflict=%s, enforce_label_apis=%t, upstream=%s, org_id=%q",
+			log.Printf("  instance %q: endpoints=%s, %d filter(s), on_conflict=%s, enforce_label_apis=%t, disclose_filters=%t, upstream=%s, org_id=%q",
 				in.Name, in.Endpoints(), len(in.Config.Filters),
 				in.Config.Enforcement.OnConflict, in.Config.Enforcement.EnforceLabelAPIs,
+				in.Config.Enforcement.DiscloseFilters,
 				in.Config.Loki.URL, in.Config.Loki.OrgID)
 		}
 		err := httpSrv.ListenAndServe()

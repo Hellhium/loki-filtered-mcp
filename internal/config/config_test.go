@@ -151,6 +151,9 @@ instances:
 	if !ri.Enforcement.EnforceLabelAPIs {
 		t.Error("enforce_label_apis must default to true (fail closed)")
 	}
+	if !ri.Enforcement.DiscloseFilters {
+		t.Error("disclose_filters must default to true")
+	}
 	if ri.Mode() != enforcer.ModeReject {
 		t.Errorf("default mode = %v", ri.Mode())
 	}
@@ -596,5 +599,44 @@ func TestFilterValues(t *testing.T) {
 	}
 	if _, ok := ri.FilterValues("app"); ok {
 		t.Error("FilterValues(app) should report not enforced")
+	}
+}
+
+// TestDiscloseFiltersInheritance covers the disclosure switch: on by default,
+// turned off for every instance from the top level, and turned back on by a
+// single instance.
+func TestDiscloseFiltersInheritance(t *testing.T) {
+	cfg, err := Load(writeConfig(t, fmt.Sprintf(`
+loki:
+  url: "http://localhost:3100"
+enforcement:
+  disclose_filters: false
+instances:
+  - name: quiet
+    auth: {type: bearer, tokens: ["%s"]}
+    filters: [{label: ns, values: ["a"]}]
+  - name: talks
+    auth: {type: bearer, tokens: ["%s"]}
+    filters: [{label: ns, values: ["b"]}]
+    enforcement:
+      disclose_filters: true
+`, tokenA, tokenB)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiet, talks := cfg.Resolved()[0], cfg.Resolved()[1]
+
+	if quiet.Enforcement.DiscloseFilters {
+		t.Error("quiet should inherit disclose_filters: false")
+	}
+	if !talks.Enforcement.DiscloseFilters {
+		t.Error("talks should override disclose_filters back to true")
+	}
+	// Disclosure says nothing about enforcement: both still enforce.
+	if quiet.Enforcement.OnConflict != "reject" || !quiet.Enforcement.EnforceLabelAPIs {
+		t.Errorf("quiet enforcement = %+v", quiet.Enforcement)
+	}
+	if !talks.Enforcement.EnforceLabelAPIs {
+		t.Errorf("talks enforcement = %+v", talks.Enforcement)
 	}
 }

@@ -94,12 +94,13 @@ func setup(t *testing.T) (*httptest.Server, *fakeLoki) {
 
 	instances, err := instance.BuildAll([]config.ResolvedInstance{
 		{
-			Name:        "team-a",
-			Tokens:      []config.Secret{config.Secret(tokenA)},
-			MCP:         true,
-			Proxy:       true,
-			Filters:     []config.Filter{{Label: "namespace", Values: []string{"team-a"}}},
-			Enforcement: config.Enforcement{OnConflict: "reject", EnforceLabelAPIs: true},
+			Name:    "team-a",
+			Tokens:  []config.Secret{config.Secret(tokenA)},
+			MCP:     true,
+			Proxy:   true,
+			Filters: []config.Filter{{Label: "namespace", Values: []string{"team-a"}}},
+			// team-a discloses its scope in the MCP handshake; team-b does not.
+			Enforcement: config.Enforcement{OnConflict: "reject", EnforceLabelAPIs: true, DiscloseFilters: true},
 			Loki:        config.Loki{URL: lokiSrv.URL, OrgID: "tenant-a", Timeout: config.Duration(0)},
 			Defaults:    config.Defaults{Limit: 100},
 		},
@@ -112,7 +113,7 @@ func setup(t *testing.T) (*httptest.Server, *fakeLoki) {
 				{Label: "namespace", Values: []string{"team-b"}},
 				{Label: "env", Values: []string{"prod"}},
 			},
-			Enforcement: config.Enforcement{OnConflict: "override", EnforceLabelAPIs: true},
+			Enforcement: config.Enforcement{OnConflict: "override", EnforceLabelAPIs: true, DiscloseFilters: false},
 			Loki:        config.Loki{URL: lokiSrv.URL, OrgID: "tenant-b", Timeout: config.Duration(0)},
 			Defaults:    config.Defaults{Limit: 100},
 		},
@@ -450,5 +451,87 @@ func TestE2EHealth(t *testing.T) {
 	resp, body := httpGet(t, srv, router.HealthPath, "")
 	if resp.StatusCode != http.StatusOK || body != "ok\n" {
 		t.Errorf("health = %d %q", resp.StatusCode, body)
+	}
+}
+
+// initialize performs only the MCP handshake and returns its result.
+func initialize(t *testing.T, srv *httptest.Server, token string) *mcp.InitializeResult {
+	t.Helper()
+	mc, err := client.NewStreamableHttpClient(srv.URL+router.MCPPath,
+		transport.WithHTTPHeaders(map[string]string{"Authorization": "Bearer " + token}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mc.Close() })
+
+	ctx := context.Background()
+	if err := mc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := mc.Initialize(ctx, mcp.InitializeRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// TestE2EInstructionsDiscloseOnlyOwnScope: the handshake describes the scope the
+// caller's own token buys, and nothing of the instance next door — same
+// isolation the queries themselves have. team-b has disclosure off and so says
+// nothing at all.
+func TestE2EInstructionsDiscloseOnlyOwnScope(t *testing.T) {
+	srv, _ := setup(t)
+
+	a := initialize(t, srv, tokenA).Instructions
+	if !strings.Contains(a, `namespace="team-a"`) {
+		t.Errorf("team-a instructions do not state its scope:\n%s", a)
+	}
+	for _, leak := range []string{"team-b", `env=`, "prod", "tenant-a", "tenant-b"} {
+		if strings.Contains(a, leak) {
+			t.Errorf("team-a instructions leak %q:\n%s", leak, a)
+		}
+	}
+
+	if b := initialize(t, srv, tokenB).Instructions; b != "" {
+		t.Errorf("team-b has disclose_filters off, want no instructions, got:\n%s", b)
+	}
+
+	// Disclosure is about what is said, not what is enforced: team-b still gets
+	// its own matchers injected.
+	res := callTool(t, mcpClient(t, srv, tokenB), "loki_query", map[string]any{"query": `{app="foo"}`})
+	if res.IsError {
+		t.Fatalf("team-b query failed: %s", resultText(t, res))
+	}
+}
+
+// TestE2EToolDescriptionsFollowDisclosure: tool descriptions are the other
+// channel a client reads, so they track the same flag.
+func TestE2EToolDescriptionsFollowDisclosure(t *testing.T) {
+	srv, _ := setup(t)
+
+	for _, tc := range []struct {
+		name      string
+		token     string
+		discloses bool
+	}{
+		{"team-a discloses", tokenA, true},
+		{"team-b does not", tokenB, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools, err := mcpClient(t, srv, tc.token).ListTools(context.Background(), mcp.ListToolsRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tool := range tools.Tools {
+				got := strings.Contains(tool.Description, "Enforced scope:")
+				if got != tc.discloses {
+					t.Errorf("%s: discloses scope = %t, want %t: %q",
+						tool.Name, got, tc.discloses, tool.Description)
+				}
+				if strings.Contains(tool.Description, "team-a") && tc.token == tokenB {
+					t.Errorf("%s leaks another instance's scope: %q", tool.Name, tool.Description)
+				}
+			}
+		})
 	}
 }
