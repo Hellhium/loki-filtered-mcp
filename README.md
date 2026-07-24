@@ -20,6 +20,133 @@ enforcement policy, and its own choice of surfaces — MCP, a Loki-compatible
 read-only HTTP proxy, or both. The token a client presents is what selects the
 instance; there are no per-instance URLs to leak.
 
+## Getting started
+
+You need a reachable Loki, and either Go 1.26+ or Docker.
+
+### 1. Write a config
+
+Everything the server does comes from one YAML file — endpoint, credentials,
+tenant, and the label scope each token gets. Start from
+[`config.example.yaml`](config.example.yaml), or with this minimum:
+
+```yaml
+loki:
+  url: "http://localhost:3100"
+
+instances:
+  - name: team-a
+    auth:
+      type: bearer
+      tokens: ["PASTE-A-GENERATED-TOKEN-HERE"]
+    filters:
+      - label: namespace
+        values: ["team-a"]
+```
+
+That grants one scope: a client holding that token can query logs, but only
+ever within `namespace="team-a"`. Generate the token yourself — it is the entire
+attack surface of the scope, and its strength is not checked:
+
+```bash
+openssl rand -base64 32 | tr -d '=+/'
+```
+
+Treat the config as a secret file (`chmod 600`), and keep it out of the image
+and out of git.
+
+### 2. Run it
+
+From source:
+
+```bash
+make build
+./loki-filtered-mcp -config config.yaml
+```
+
+Or with Docker, mounting the config read-only:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$PWD/config.yaml:/etc/loki-filtered-mcp/config.yaml:ro" \
+  ghcr.io/hellhium/loki-filtered-mcp:latest
+```
+
+Startup logs one line per instance — its endpoints, filter count and upstream —
+and never a token. A config that is ambiguous about scope does not start.
+
+### 3. Check it is up
+
+```bash
+TOKEN='PASTE-A-GENERATED-TOKEN-HERE'
+
+# liveness — the only unauthenticated path
+curl -s http://localhost:8080/healthz
+
+# MCP handshake
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}'
+```
+
+### 4. Connect an MCP client
+
+MCP is served over **Streamable HTTP** at `POST /mcp`; the instance token goes
+in an `Authorization: Bearer …` header. There is no stdio transport and no
+command to launch — the server is already running.
+
+**Claude Code:**
+
+```bash
+claude mcp add --transport http loki http://localhost:8080/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+**Any client configured by JSON** (Claude Code's `.mcp.json`, Cursor, Windsurf,
+VS Code …):
+
+```json
+{
+  "mcpServers": {
+    "loki": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer PASTE-A-GENERATED-TOKEN-HERE" }
+    }
+  }
+}
+```
+
+**Clients that speak stdio only** (Claude Desktop, older clients) need a bridge:
+
+```json
+{
+  "mcpServers": {
+    "loki": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://localhost:8080/mcp",
+        "--header", "Authorization: Bearer PASTE-A-GENERATED-TOKEN-HERE"
+      ]
+    }
+  }
+}
+```
+
+Once connected, the client sees three tools — `loki_query`,
+`loki_label_names`, `loki_label_values` — and nothing that lets it change the
+endpoint, the credentials or the scope. Ask it something like *"which namespaces
+can you see, and what errors are in them in the last hour?"*: the values it gets
+back for `namespace` are the configured ones and nothing else, and whatever
+query it then runs is rewritten to carry `namespace="team-a"` before it reaches
+Loki.
+
+To give a client a different scope, add another instance with its own token and
+filters. To expose the same scope to Grafana or `logcli` instead, set
+`endpoints.proxy: true` and see [The Loki proxy](#the-loki-proxy).
+
 ## How enforcement works
 
 Every query is **parsed into a LogQL AST** using Loki's own parser, and the
@@ -171,33 +298,48 @@ instance with both endpoints disabled.
 
 ## Running
 
-```bash
-make build
-./loki-filtered-mcp -config config.example.yaml
-```
-
+`-config <path>` is the only flag; everything else is in the file. See
+[Getting started](#getting-started) for a first run and for MCP client setup.
 MCP is served over **Streamable HTTP only** (no SSE, no stdio) at `POST /mcp`,
-in stateless mode. Point your MCP client at `http://<listen>/mcp` and give it
-the instance's token as an `Authorization: Bearer …` header.
-
-Quick checks:
+in stateless mode. The proxy, on an instance with `endpoints.proxy: true`:
 
 ```bash
-# liveness (no token)
-curl -s http://localhost:8080/healthz
-
-# MCP handshake
-curl -s -X POST http://localhost:8080/mcp \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}'
-
-# the proxy, on an instance with endpoints.proxy: true
 curl -s -H "Authorization: Bearer $TOKEN" \
   --data-urlencode 'query={app="api"}' \
   --get http://localhost:8080/loki/api/v1/query_range
 ```
+
+### Docker
+
+Images are published to `ghcr.io/hellhium/loki-filtered-mcp` for `linux/amd64`
+and `linux/arm64` — `latest` from `master`, plus `1.2.3`/`1.2`/`1` for `v*` tags
+and a `sha-<commit>` tag for every build. The image is distroless: no shell, no
+package manager, runs as `nonroot`, and holds nothing but the binary.
+
+The config is not baked in — mount it at `/etc/loki-filtered-mcp/config.yaml`,
+or point `-config` elsewhere:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v /etc/lfm/config.yaml:/etc/loki-filtered-mcp/config.yaml:ro \
+  ghcr.io/hellhium/loki-filtered-mcp:latest
+```
+
+```yaml
+# compose
+services:
+  loki-filtered-mcp:
+    image: ghcr.io/hellhium/loki-filtered-mcp:latest
+    ports: ["8080:8080"]
+    volumes:
+      - ./config.yaml:/etc/loki-filtered-mcp/config.yaml:ro
+    read_only: true
+```
+
+`GET /healthz` is unauthenticated and is the liveness/readiness probe.
+
+To build it yourself, `docker build --build-arg VERSION=$(git describe --tags
+--always) -t loki-filtered-mcp .` — the same Dockerfile CI uses.
 
 ### Grafana
 
@@ -236,6 +378,12 @@ make vet         # go vet ./...
 make fmt-check   # gofmt -l .
 make all         # fmt-check + vet + test + build
 ```
+
+CI is [`.github/workflows/docker.yml`](.github/workflows/docker.yml): every pull
+request builds the image for `amd64` and smoke-tests it (missing config must
+fail, `/healthz` must answer); pushes to `master` and `v*` tags build both
+architectures and publish to GHCR with an SBOM and a signed provenance
+attestation.
 
 The layout keeps concerns separate so the enforcer is unit-testable without a
 live Loki:

@@ -1,0 +1,14 @@
+# Everything the build does not need. Keeping this tight also keeps secrets out
+# of the build context: a real config.yaml never belongs in an image.
+.git
+.github
+.claude
+references
+*.yaml
+!config.example.yaml
+loki-filtered-mcp
+Dockerfile
+.dockerignore
+README.md
+CLAUDE.md
+Makefile

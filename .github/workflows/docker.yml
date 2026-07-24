@@ -1,0 +1,122 @@
+name: docker
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Pull requests build for amd64 only and are never pushed: the point is to
+      # prove the Dockerfile still builds, not to publish from an untrusted ref.
+      - name: Set build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        if: steps.params.outputs.push == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: steps.params.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=loki-filtered-mcp
+            org.opencontainers.image.description=Loki MCP server that enforces label matchers on every LogQL query
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ steps.params.outputs.platforms }}
+          push: ${{ steps.params.outputs.push }}
+          load: ${{ steps.params.outputs.push == 'false' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The version baked into the binary and reported by the MCP server.
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: ${{ steps.params.outputs.push }}
+          sbom: ${{ steps.params.outputs.push }}
+
+      # A smoke test on the image we just built: a bad config must fail loudly,
+      # and a valid one must come up and answer /healthz.
+      - name: Smoke test the image
+        if: steps.params.outputs.push == 'false'
+        run: |
+          set -euo pipefail
+          image="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+
+          # No config -> non-zero exit, not a server listening on nothing.
+          if docker run --rm --entrypoint /usr/local/bin/loki-filtered-mcp "$image"; then
+            echo "expected a failure when -config is missing"; exit 1
+          fi
+
+          docker run -d --name lfm -p 8080:8080 \
+            -v "$PWD/config.example.yaml:/etc/loki-filtered-mcp/config.yaml:ro" "$image"
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs lfm
+          docker rm -f lfm
+          test "${ok:-0}" = 1
+
+      - name: Attest build provenance
+        if: steps.params.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
